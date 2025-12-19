@@ -1,0 +1,1667 @@
+Detailed Implementation Plan: Music-to-Dancing Video App
+Building with Claude Code + VS Code (Local Development)
+
+1. Project Overview & Tech Stack
+Recommended Stack for Local Development
+LayerTechnologyReasonBackendPython 3.11+ / FastAPIBest audio processing libraries, async supportAudio Analysislibrosa, essentiaIndustry standard for beat/tempo detectionLLM IntegrationAnthropic Claude APIChoreography planningVideo GenerationViggle API (unofficial) or ReplicateDance generationVideo AssemblyFFmpeg + moviepyReliable stitching/renderingQueue SystemRedis + RQ (or Celery)Background job processingDatabaseSQLite (dev) → PostgreSQL (prod)Job trackingFrontendReact + Vite (or simple HTML)Upload interfaceStorageLocal filesystem (dev) → S3 (prod)Media files
+
+2. Project Structure
+music-dance-generator/
+├── README.md
+├── .env.example
+├── .env                          # Your API keys (gitignored)
+├── .gitignore
+├── docker-compose.yml            # Redis + optional services
+├── requirements.txt
+├── pyproject.toml
+│
+├── backend/
+│   ├── __init__.py
+│   ├── main.py                   # FastAPI entry point
+│   ├── config.py                 # Settings & env vars
+│   │
+│   ├── api/
+│   │   ├── __init__.py
+│   │   ├── routes/
+│   │   │   ├── __init__.py
+│   │   │   ├── upload.py         # POST /upload
+│   │   │   ├── jobs.py           # GET /jobs/{id}, job status
+│   │   │   └── health.py         # Health check
+│   │   └── schemas/
+│   │       ├── __init__.py
+│   │       ├── job.py            # Pydantic models
+│   │       └── audio.py
+│   │
+│   ├── services/
+│   │   ├── __init__.py
+│   │   ├── audio_analyzer.py     # librosa/essentia processing
+│   │   ├── choreographer.py      # Claude LLM integration
+│   │   ├── video_generator.py    # Viggle/Replicate client
+│   │   ├── video_assembler.py    # FFmpeg stitching
+│   │   └── storage.py            # File storage abstraction
+│   │
+│   ├── workers/
+│   │   ├── __init__.py
+│   │   ├── tasks.py              # RQ/Celery task definitions
+│   │   └── pipeline.py           # Orchestration logic
+│   │
+│   ├── models/
+│   │   ├── __init__.py
+│   │   └── job.py                # SQLAlchemy/DB models
+│   │
+│   └── utils/
+│       ├── __init__.py
+│       ├── ffmpeg_utils.py
+│       └── time_utils.py
+│
+├── frontend/                     # Simple upload UI
+│   ├── index.html
+│   ├── style.css
+│   └── app.js
+│
+├── storage/                      # Local file storage (dev)
+│   ├── uploads/
+│   ├── clips/
+│   └── output/
+│
+├── templates/                    # Dance templates/presets
+│   └── dance_styles.json
+│
+├── tests/
+│   ├── __init__.py
+│   ├── test_audio_analyzer.py
+│   ├── test_choreographer.py
+│   └── test_video_assembler.py
+│
+└── scripts/
+    ├── setup.sh                  # Initial setup script
+    ├── run_worker.sh             # Start background worker
+    └── test_pipeline.py          # Manual pipeline test
+
+3. Phase-by-Phase Implementation Plan
+Phase 1: Project Setup & Foundation (Day 1-2)
+Step 1.1: Initialize Project with Claude Code
+Open VS Code, then use Claude Code to scaffold:
+bash# In terminal, start Claude Code
+claude
+
+# Then ask Claude Code:
+> Create a new Python FastAPI project for a music-to-dance video generator. 
+> Set up the folder structure, pyproject.toml, requirements.txt, and basic FastAPI app.
+```
+
+#### Step 1.2: Core Dependencies
+
+**requirements.txt:**
+```
+# Web Framework
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+python-multipart==0.0.6
+
+# Audio Processing
+librosa==0.10.1
+numpy==1.26.3
+scipy==1.12.0
+soundfile==0.12.1
+
+# LLM
+anthropic==0.18.1
+
+# Video Processing
+moviepy==1.0.3
+ffmpeg-python==0.2.0
+
+# Background Jobs
+redis==5.0.1
+rq==1.16.0
+
+# Database
+sqlalchemy==2.0.25
+aiosqlite==0.19.0
+
+# Utilities
+python-dotenv==1.0.0
+pydantic==2.5.3
+pydantic-settings==2.1.0
+httpx==0.26.0
+aiofiles==23.2.1
+
+# HTTP Client for APIs
+requests==2.31.0
+Step 1.3: Environment Configuration
+.env.example:
+bash# API Keys
+ANTHROPIC_API_KEY=sk-ant-xxxxx
+VIGGLE_API_KEY=your_viggle_key_here        # If available
+REPLICATE_API_TOKEN=r8_xxxxx               # Alternative
+
+# Redis
+REDIS_URL=redis://localhost:6379/0
+
+# Storage
+STORAGE_PATH=./storage
+UPLOAD_DIR=./storage/uploads
+CLIPS_DIR=./storage/clips
+OUTPUT_DIR=./storage/output
+
+# App Settings
+DEBUG=true
+MAX_UPLOAD_SIZE_MB=50
+DEFAULT_VIDEO_DURATION=210                  # 3.5 minutes in seconds
+```
+
+---
+
+### Phase 2: Audio Analysis Service (Day 2-3)
+
+#### Step 2.1: Audio Analyzer Implementation
+
+Ask Claude Code:
+```
+> Create backend/services/audio_analyzer.py that:
+> 1. Takes an MP3 file path
+> 2. Uses librosa to detect BPM, beats, and sections
+> 3. Returns structured JSON with timing data
+> Include error handling and logging.
+backend/services/audio_analyzer.py:
+pythonimport librosa
+import numpy as np
+from dataclasses import dataclass, asdict
+from typing import List, Optional
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class Section:
+    label: str
+    start: float
+    end: float
+    energy: float  # 0-1 scale
+
+
+@dataclass
+class AudioAnalysis:
+    duration_sec: float
+    bpm: float
+    time_signature: int
+    sections: List[Section]
+    beats: List[float]
+    downbeats: List[float]
+    energy_curve: List[float]  # Sampled every 0.5 sec
+    
+    def to_dict(self):
+        return asdict(self)
+
+
+class AudioAnalyzer:
+    def __init__(self, hop_length: int = 512, sr: int = 22050):
+        self.hop_length = hop_length
+        self.sr = sr
+    
+    def analyze(self, audio_path: str) -> AudioAnalysis:
+        """Full audio analysis pipeline."""
+        logger.info(f"Analyzing audio: {audio_path}")
+        
+        # Load audio
+        y, sr = librosa.load(audio_path, sr=self.sr)
+        duration = librosa.get_duration(y=y, sr=sr)
+        
+        # Tempo and beats
+        tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
+        beats = librosa.frames_to_time(beat_frames, sr=sr).tolist()
+        
+        # Estimate time signature (simplified)
+        time_sig = self._estimate_time_signature(beats)
+        
+        # Downbeats (every 4 beats for 4/4)
+        downbeats = beats[::time_sig] if beats else []
+        
+        # Energy curve (RMS)
+        rms = librosa.feature.rms(y=y, hop_length=self.hop_length)[0]
+        energy_curve = self._resample_curve(rms, duration, sample_rate=2)  # 2 samples/sec
+        
+        # Section detection
+        sections = self._detect_sections(y, sr, duration, energy_curve)
+        
+        return AudioAnalysis(
+            duration_sec=round(duration, 2),
+            bpm=round(float(tempo), 1),
+            time_signature=time_sig,
+            sections=sections,
+            beats=[round(b, 3) for b in beats],
+            downbeats=[round(d, 3) for d in downbeats],
+            energy_curve=[round(e, 3) for e in energy_curve]
+        )
+    
+    def _estimate_time_signature(self, beats: List[float]) -> int:
+        """Simple heuristic - default to 4/4."""
+        # Could be enhanced with more sophisticated analysis
+        return 4
+    
+    def _resample_curve(self, curve: np.ndarray, duration: float, sample_rate: int) -> List[float]:
+        """Resample curve to fixed sample rate."""
+        num_samples = int(duration * sample_rate)
+        indices = np.linspace(0, len(curve) - 1, num_samples).astype(int)
+        resampled = curve[indices]
+        # Normalize to 0-1
+        if resampled.max() > 0:
+            resampled = resampled / resampled.max()
+        return resampled.tolist()
+    
+    def _detect_sections(
+        self, 
+        y: np.ndarray, 
+        sr: int, 
+        duration: float,
+        energy_curve: List[float]
+    ) -> List[Section]:
+        """Detect song sections using structural analysis."""
+        
+        # Use librosa's segment detection
+        try:
+            # Compute mel spectrogram for structure analysis
+            S = librosa.feature.melspectrogram(y=y, sr=sr)
+            
+            # Use recurrence matrix for structure
+            chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
+            bounds = librosa.segment.agglomerative(chroma, k=8)  # ~8 sections
+            bound_times = librosa.frames_to_time(bounds, sr=sr)
+            
+        except Exception as e:
+            logger.warning(f"Section detection failed, using fallback: {e}")
+            # Fallback: divide into equal sections
+            num_sections = max(4, int(duration / 30))  # ~30 sec sections
+            bound_times = np.linspace(0, duration, num_sections + 1)
+        
+        # Label sections based on energy
+        sections = []
+        labels = ["intro", "verse", "chorus", "verse", "chorus", "bridge", "chorus", "outro"]
+        
+        for i in range(len(bound_times) - 1):
+            start = bound_times[i]
+            end = bound_times[i + 1]
+            
+            # Calculate average energy for this section
+            start_idx = int(start * 2)  # 2 samples/sec
+            end_idx = int(end * 2)
+            section_energy = np.mean(energy_curve[start_idx:end_idx]) if end_idx > start_idx else 0.5
+            
+            # Assign label based on position and energy
+            label = labels[i % len(labels)]
+            if i == 0:
+                label = "intro"
+            elif i == len(bound_times) - 2:
+                label = "outro"
+            elif section_energy > 0.7:
+                label = "chorus"
+            elif section_energy < 0.4:
+                label = "verse"
+            
+            sections.append(Section(
+                label=label,
+                start=round(float(start), 2),
+                end=round(float(end), 2),
+                energy=round(float(section_energy), 2)
+            ))
+        
+        return sections
+
+
+# Quick test
+if __name__ == "__main__":
+    analyzer = AudioAnalyzer()
+    # result = analyzer.analyze("test.mp3")
+    # print(result.to_dict())
+```
+
+---
+
+### Phase 3: LLM Choreographer Service (Day 3-4)
+
+#### Step 3.1: Claude Integration for Dance Planning
+
+Ask Claude Code:
+```
+> Create backend/services/choreographer.py that:
+> 1. Takes audio analysis JSON and user style preferences
+> 2. Calls Claude API to generate a dance storyboard
+> 3. Returns structured segments with motion prompts
+> Use proper async/await and error handling.
+backend/services/choreographer.py:
+pythonimport anthropic
+import json
+from typing import List, Optional
+from dataclasses import dataclass, asdict
+from pydantic import BaseModel
+import logging
+
+from backend.config import settings
+
+logger = logging.getLogger(__name__)
+
+
+class DanceSegment(BaseModel):
+    start: float
+    end: float
+    section: str
+    motion_prompt: str
+    intensity: int  # 1-5
+    camera_framing: str  # "full_body", "medium", "close_up"
+    template_type: str  # "TEXT_PROMPT" or "TEMPLATE"
+    template_id: Optional[str] = None
+
+
+class DanceStoryboard(BaseModel):
+    segments: List[DanceSegment]
+    style: str
+    total_duration: float
+    character_description: str
+
+
+CHOREOGRAPHER_SYSTEM_PROMPT = """You are an expert dance choreographer and music video director. 
+Your job is to create detailed dance segment plans that sync with music.
+
+Given audio analysis data (BPM, sections, energy levels) and a dance style, you will output a JSON storyboard.
+
+Rules:
+1. Each segment should be 4-8 seconds long
+2. Align segment boundaries with beat positions when possible
+3. Match movement intensity to the section's energy level
+4. Use variety - don't repeat the same moves in consecutive segments
+5. Consider smooth transitions between segments
+6. For high-energy sections (chorus), use more dynamic moves
+7. For low-energy sections (verse, intro), use subtler movements
+
+Camera framing options: "full_body", "medium_shot", "close_up"
+Intensity scale: 1 (minimal movement) to 5 (explosive energy)
+
+Output ONLY valid JSON matching this schema:
+{
+  "segments": [
+    {
+      "start": 0.0,
+      "end": 6.0,
+      "section": "intro",
+      "motion_prompt": "slow body wave, gentle head movement, soft arm extensions",
+      "intensity": 2,
+      "camera_framing": "medium_shot",
+      "template_type": "TEXT_PROMPT",
+      "template_id": null
+    }
+  ],
+  "style": "afrobeat",
+  "total_duration": 210.0,
+  "character_description": "dancer in casual streetwear"
+}
+"""
+
+
+class Choreographer:
+    def __init__(self):
+        self.client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+        self.model = "claude-sonnet-4-20250514"
+    
+    async def create_storyboard(
+        self,
+        audio_analysis: dict,
+        style: str = "hip-hop",
+        character_description: str = "professional dancer in casual attire",
+        segment_duration: tuple = (4, 8)
+    ) -> DanceStoryboard:
+        """Generate a dance storyboard from audio analysis."""
+        
+        user_prompt = f"""Create a dance storyboard for this song:
+
+AUDIO ANALYSIS:
+{json.dumps(audio_analysis, indent=2)}
+
+STYLE: {style}
+CHARACTER: {character_description}
+TARGET SEGMENT LENGTH: {segment_duration[0]}-{segment_duration[1]} seconds
+
+Generate segments that cover the entire song duration ({audio_analysis['duration_sec']} seconds).
+Ensure movements match the energy of each section.
+Output ONLY the JSON storyboard, no other text."""
+
+        try:
+            response = self.client.messages.create(
+                model=self.model,
+                max_tokens=4096,
+                system=CHOREOGRAPHER_SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": user_prompt}]
+            )
+            
+            # Extract JSON from response
+            content = response.content[0].text
+            
+            # Clean up response if needed
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0]
+            elif "```" in content:
+                content = content.split("```")[1].split("```")[0]
+            
+            storyboard_data = json.loads(content.strip())
+            storyboard = DanceStoryboard(**storyboard_data)
+            
+            logger.info(f"Generated storyboard with {len(storyboard.segments)} segments")
+            return storyboard
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse LLM response as JSON: {e}")
+            logger.error(f"Raw response: {content}")
+            raise ValueError("Choreographer returned invalid JSON")
+        except Exception as e:
+            logger.error(f"Choreographer error: {e}")
+            raise
+    
+    def validate_storyboard(self, storyboard: DanceStoryboard, audio_duration: float) -> bool:
+        """Validate that storyboard covers the full audio duration."""
+        if not storyboard.segments:
+            return False
+        
+        # Check coverage
+        last_end = storyboard.segments[-1].end
+        if last_end < audio_duration - 5:  # Allow 5 sec tolerance
+            logger.warning(f"Storyboard ends at {last_end}s but audio is {audio_duration}s")
+            return False
+        
+        # Check for gaps
+        for i in range(1, len(storyboard.segments)):
+            prev_end = storyboard.segments[i-1].end
+            curr_start = storyboard.segments[i].start
+            if curr_start - prev_end > 1:  # More than 1 sec gap
+                logger.warning(f"Gap detected between segments {i-1} and {i}")
+                return False
+        
+        return True
+
+
+# Dance style presets for prompting
+STYLE_PRESETS = {
+    "hip-hop": {
+        "moves": ["popping", "locking", "breaking", "krump", "tutting"],
+        "vibe": "urban, street, powerful"
+    },
+    "afrobeat": {
+        "moves": ["azonto", "gwara gwara", "shaku shaku", "leg work", "body rolls"],
+        "vibe": "rhythmic, joyful, grounded"
+    },
+    "contemporary": {
+        "moves": ["floor work", "extensions", "contractions", "spirals", "falls"],
+        "vibe": "fluid, emotional, artistic"
+    },
+    "k-pop": {
+        "moves": ["point choreography", "formations", "synchronized moves", "sharp isolations"],
+        "vibe": "precise, energetic, polished"
+    },
+    "latin": {
+        "moves": ["salsa steps", "hip motion", "body waves", "arm styling", "turns"],
+        "vibe": "sensual, rhythmic, passionate"
+    }
+}
+```
+
+---
+
+### Phase 4: Video Generation Service (Day 4-6)
+
+#### Step 4.1: Viggle/Replicate Integration
+
+Ask Claude Code:
+```
+> Create backend/services/video_generator.py that:
+> 1. Interfaces with Viggle API (or Replicate as fallback)
+> 2. Generates dance clips from motion prompts + character image
+> 3. Handles async job polling
+> 4. Returns video clip URLs/paths
+backend/services/video_generator.py:
+pythonimport httpx
+import asyncio
+import replicate
+from typing import Optional, List
+from dataclasses import dataclass
+from enum import Enum
+import logging
+import time
+
+from backend.config import settings
+
+logger = logging.getLogger(__name__)
+
+
+class GeneratorBackend(Enum):
+    VIGGLE = "viggle"
+    REPLICATE = "replicate"
+    LOCAL = "local"  # For testing
+
+
+@dataclass
+class ClipGenerationRequest:
+    segment_id: int
+    character_image_url: str
+    motion_prompt: str
+    duration: float
+    template_id: Optional[str] = None
+
+
+@dataclass
+class ClipGenerationResult:
+    segment_id: int
+    success: bool
+    video_url: Optional[str] = None
+    video_path: Optional[str] = None
+    error: Optional[str] = None
+    generation_time: float = 0
+
+
+class VideoGenerator:
+    """Abstract base for video generation backends."""
+    
+    def __init__(self, backend: GeneratorBackend = GeneratorBackend.REPLICATE):
+        self.backend = backend
+        
+        if backend == GeneratorBackend.REPLICATE:
+            self.client = replicate.Client(api_token=settings.REPLICATE_API_TOKEN)
+        elif backend == GeneratorBackend.VIGGLE:
+            self.viggle_api_key = settings.VIGGLE_API_KEY
+            self.viggle_base_url = "https://api.viggle.ai/v1"  # Hypothetical
+    
+    async def generate_clip(self, request: ClipGenerationRequest) -> ClipGenerationResult:
+        """Generate a single dance clip."""
+        start_time = time.time()
+        
+        try:
+            if self.backend == GeneratorBackend.REPLICATE:
+                result = await self._generate_replicate(request)
+            elif self.backend == GeneratorBackend.VIGGLE:
+                result = await self._generate_viggle(request)
+            else:
+                result = await self._generate_mock(request)
+            
+            result.generation_time = time.time() - start_time
+            return result
+            
+        except Exception as e:
+            logger.error(f"Clip generation failed for segment {request.segment_id}: {e}")
+            return ClipGenerationResult(
+                segment_id=request.segment_id,
+                success=False,
+                error=str(e),
+                generation_time=time.time() - start_time
+            )
+    
+    async def generate_batch(
+        self, 
+        requests: List[ClipGenerationRequest],
+        max_concurrent: int = 3
+    ) -> List[ClipGenerationResult]:
+        """Generate multiple clips with concurrency control."""
+        semaphore = asyncio.Semaphore(max_concurrent)
+        
+        async def generate_with_limit(req):
+            async with semaphore:
+                return await self.generate_clip(req)
+        
+        tasks = [generate_with_limit(req) for req in requests]
+        results = await asyncio.gather(*tasks)
+        return results
+    
+    async def _generate_replicate(self, request: ClipGenerationRequest) -> ClipGenerationResult:
+        """Generate using Replicate's video models."""
+        
+        # Option 1: Use Stable Video Diffusion with dance prompt
+        # Option 2: Use specialized dance models if available
+        
+        try:
+            # Example using a hypothetical dance model on Replicate
+            # In practice, you'd use models like:
+            # - stability-ai/stable-video-diffusion
+            # - animate-diff models
+            # - Custom fine-tuned models
+            
+            output = await asyncio.to_thread(
+                self.client.run,
+                "stability-ai/stable-video-diffusion:3f0457e4619daac51203dedb472816fd4af51f3149fa7a9e0b5ffcf1b8172438",
+                input={
+                    "input_image": request.character_image_url,
+                    "motion_bucket_id": 127,  # Higher = more motion
+                    "fps": 24,
+                    "num_frames": int(request.duration * 24),  # frames = duration * fps
+                }
+            )
+            
+            # Output is typically a URL to the generated video
+            video_url = output if isinstance(output, str) else output[0]
+            
+            return ClipGenerationResult(
+                segment_id=request.segment_id,
+                success=True,
+                video_url=video_url
+            )
+            
+        except Exception as e:
+            raise RuntimeError(f"Replicate generation failed: {e}")
+    
+    async def _generate_viggle(self, request: ClipGenerationRequest) -> ClipGenerationResult:
+        """Generate using Viggle API (hypothetical implementation)."""
+        
+        async with httpx.AsyncClient() as client:
+            # Step 1: Submit generation job
+            response = await client.post(
+                f"{self.viggle_base_url}/generate",
+                headers={"Authorization": f"Bearer {self.viggle_api_key}"},
+                json={
+                    "character_image_url": request.character_image_url,
+                    "mode": "template" if request.template_id else "text",
+                    "template_id": request.template_id,
+                    "prompt": request.motion_prompt,
+                    "duration": request.duration
+                },
+                timeout=30
+            )
+            response.raise_for_status()
+            job_data = response.json()
+            task_id = job_data["task_id"]
+            
+            # Step 2: Poll for completion
+            max_polls = 120  # 10 minutes max
+            poll_interval = 5  # seconds
+            
+            for _ in range(max_polls):
+                await asyncio.sleep(poll_interval)
+                
+                status_response = await client.get(
+                    f"{self.viggle_base_url}/status/{task_id}",
+                    headers={"Authorization": f"Bearer {self.viggle_api_key}"}
+                )
+                status_data = status_response.json()
+                
+                if status_data["status"] == "completed":
+                    return ClipGenerationResult(
+                        segment_id=request.segment_id,
+                        success=True,
+                        video_url=status_data["video_url"]
+                    )
+                elif status_data["status"] == "failed":
+                    raise RuntimeError(status_data.get("error", "Unknown error"))
+            
+            raise TimeoutError("Generation timed out")
+    
+    async def _generate_mock(self, request: ClipGenerationRequest) -> ClipGenerationResult:
+        """Mock generator for testing."""
+        await asyncio.sleep(2)  # Simulate processing
+        return ClipGenerationResult(
+            segment_id=request.segment_id,
+            success=True,
+            video_url=f"https://example.com/mock_clip_{request.segment_id}.mp4"
+        )
+
+
+# Alternative: Using AnimateDiff or other open-source models locally
+class LocalVideoGenerator:
+    """For running models locally with GPU."""
+    
+    def __init__(self, model_path: str = None):
+        # This would initialize local model
+        # Requires significant GPU resources
+        pass
+    
+    async def generate(self, request: ClipGenerationRequest) -> ClipGenerationResult:
+        # Local generation logic
+        # Would use something like:
+        # - ComfyUI with AnimateDiff
+        # - Deforum
+        # - Custom pipeline
+        pass
+```
+
+---
+
+### Phase 5: Video Assembly Service (Day 6-7)
+
+#### Step 5.1: FFmpeg Stitching
+
+Ask Claude Code:
+```
+> Create backend/services/video_assembler.py that:
+> 1. Downloads all generated clips
+> 2. Normalizes resolution/format
+> 3. Adds transitions between clips
+> 4. Overlays original audio
+> 5. Outputs final 3.5 minute video
+backend/services/video_assembler.py:
+pythonimport subprocess
+import os
+import asyncio
+import aiofiles
+import httpx
+from pathlib import Path
+from typing import List, Optional
+from dataclasses import dataclass
+import logging
+import shutil
+
+from backend.config import settings
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ClipInfo:
+    segment_id: int
+    start: float
+    end: float
+    source_path: str
+    duration: float
+
+
+@dataclass
+class AssemblyConfig:
+    output_path: str
+    audio_path: str
+    resolution: tuple = (1080, 1920)  # 9:16 default
+    fps: int = 30
+    transition_duration: float = 0.3  # seconds
+    transition_type: str = "xfade"  # crossfade
+
+
+class VideoAssembler:
+    def __init__(self, work_dir: str = None):
+        self.work_dir = Path(work_dir or settings.CLIPS_DIR)
+        self.work_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Verify FFmpeg is available
+        if not shutil.which("ffmpeg"):
+            raise RuntimeError("FFmpeg not found. Please install FFmpeg.")
+    
+    async def download_clip(self, url: str, output_path: str) -> bool:
+        """Download a video clip from URL."""
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(url, timeout=60)
+                response.raise_for_status()
+                
+                async with aiofiles.open(output_path, 'wb') as f:
+                    await f.write(response.content)
+                
+                return True
+        except Exception as e:
+            logger.error(f"Failed to download {url}: {e}")
+            return False
+    
+    async def prepare_clips(
+        self, 
+        clips: List[ClipInfo],
+        config: AssemblyConfig
+    ) -> List[str]:
+        """Normalize all clips to consistent format."""
+        prepared_paths = []
+        
+        for clip in clips:
+            output_path = self.work_dir / f"prepared_{clip.segment_id}.mp4"
+            
+            # FFmpeg command to normalize
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", clip.source_path,
+                "-vf", f"scale={config.resolution[0]}:{config.resolution[1]}:force_original_aspect_ratio=decrease,pad={config.resolution[0]}:{config.resolution[1]}:(ow-iw)/2:(oh-ih)/2",
+                "-r", str(config.fps),
+                "-c:v", "libx264",
+                "-preset", "fast",
+                "-crf", "23",
+                "-an",  # Remove audio, we'll add original later
+                "-t", str(clip.duration),  # Trim to exact duration
+                str(output_path)
+            ]
+            
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+            
+            if process.returncode != 0:
+                logger.error(f"FFmpeg error for clip {clip.segment_id}: {stderr.decode()}")
+                continue
+            
+            prepared_paths.append(str(output_path))
+        
+        return prepared_paths
+    
+    async def concatenate_with_transitions(
+        self,
+        clip_paths: List[str],
+        output_path: str,
+        transition_duration: float = 0.3
+    ) -> bool:
+        """Concatenate clips with crossfade transitions."""
+        
+        if len(clip_paths) == 0:
+            raise ValueError("No clips to concatenate")
+        
+        if len(clip_paths) == 1:
+            # Just copy the single clip
+            shutil.copy(clip_paths[0], output_path)
+            return True
+        
+        # Build complex FFmpeg filter for xfade transitions
+        # This is a simplified version - production would need more sophistication
+        
+        filter_parts = []
+        inputs = []
+        
+        for i, path in enumerate(clip_paths):
+            inputs.extend(["-i", path])
+        
+        # Build xfade chain
+        # [0][1]xfade=transition=fade:duration=0.3[v01];[v01][2]xfade=...
+        current_label = "[0]"
+        
+        for i in range(1, len(clip_paths)):
+            next_label = f"[v{i-1}{i}]" if i < len(clip_paths) - 1 else "[vout]"
+            filter_parts.append(
+                f"{current_label}[{i}]xfade=transition=fade:duration={transition_duration}:offset={i*4-transition_duration}{next_label}"
+            )
+            current_label = next_label
+        
+        filter_complex = ";".join(filter_parts)
+        
+        cmd = [
+            "ffmpeg", "-y",
+            *inputs,
+            "-filter_complex", filter_complex,
+            "-map", "[vout]",
+            "-c:v", "libx264",
+            "-preset", "fast",
+            "-crf", "23",
+            output_path
+        ]
+        
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await process.communicate()
+        
+        if process.returncode != 0:
+            logger.error(f"Concatenation failed: {stderr.decode()}")
+            # Fallback: simple concat without transitions
+            return await self._simple_concat(clip_paths, output_path)
+        
+        return True
+    
+    async def _simple_concat(self, clip_paths: List[str], output_path: str) -> bool:
+        """Simple concatenation without transitions (fallback)."""
+        
+        # Create concat list file
+        list_file = self.work_dir / "concat_list.txt"
+        async with aiofiles.open(list_file, 'w') as f:
+            for path in clip_paths:
+                await f.write(f"file '{path}'\n")
+        
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", str(list_file),
+            "-c", "copy",
+            output_path
+        ]
+        
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        await process.communicate()
+        
+        return process.returncode == 0
+    
+    async def add_audio(
+        self,
+        video_path: str,
+        audio_path: str,
+        output_path: str
+    ) -> bool:
+        """Add audio track to video."""
+        
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", video_path,
+            "-i", audio_path,
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-shortest",  # End when shortest stream ends
+            "-map", "0:v:0",
+            "-map", "1:a:0",
+            output_path
+        ]
+        
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await process.communicate()
+        
+        if process.returncode != 0:
+            logger.error(f"Audio merge failed: {stderr.decode()}")
+            return False
+        
+        return True
+    
+    async def assemble_full_video(
+        self,
+        clips: List[ClipInfo],
+        config: AssemblyConfig
+    ) -> Optional[str]:
+        """Full assembly pipeline."""
+        
+        logger.info(f"Assembling {len(clips)} clips into final video")
+        
+        # Step 1: Download clips if they're URLs
+        for clip in clips:
+            if clip.source_path.startswith("http"):
+                local_path = self.work_dir / f"raw_{clip.segment_id}.mp4"
+                success = await self.download_clip(clip.source_path, str(local_path))
+                if success:
+                    clip.source_path = str(local_path)
+                else:
+                    logger.error(f"Failed to download clip {clip.segment_id}")
+                    return None
+        
+        # Step 2: Prepare/normalize clips
+        prepared_paths = await self.prepare_clips(clips, config)
+        if len(prepared_paths) != len(clips):
+            logger.warning(f"Some clips failed to prepare: {len(prepared_paths)}/{len(clips)}")
+        
+        # Step 3: Concatenate with transitions
+        video_only_path = self.work_dir / "video_only.mp4"
+        success = await self.concatenate_with_transitions(
+            prepared_paths,
+            str(video_only_path),
+            config.transition_duration
+        )
+        
+        if not success:
+            logger.error("Concatenation failed")
+            return None
+        
+        # Step 4: Add original audio
+        success = await self.add_audio(
+            str(video_only_path),
+            config.audio_path,
+            config.output_path
+        )
+        
+        if not success:
+            logger.error("Audio merge failed")
+            return None
+        
+        logger.info(f"Final video assembled: {config.output_path}")
+        return config.output_path
+    
+    def cleanup(self, keep_final: bool = True):
+        """Clean up temporary files."""
+        for file in self.work_dir.glob("prepared_*.mp4"):
+            file.unlink()
+        for file in self.work_dir.glob("raw_*.mp4"):
+            file.unlink()
+        
+        video_only = self.work_dir / "video_only.mp4"
+        if video_only.exists():
+            video_only.unlink()
+
+Phase 6: API & Pipeline Orchestration (Day 7-9)
+Step 6.1: FastAPI Routes
+backend/api/routes/upload.py:
+pythonfrom fastapi import APIRouter, UploadFile, File, Form, HTTPException, BackgroundTasks
+from fastapi.responses import JSONResponse
+import uuid
+import aiofiles
+from pathlib import Path
+
+from backend.config import settings
+from backend.workers.tasks import start_video_generation_pipeline
+from backend.models.job import Job, JobStatus
+from backend.api.schemas.job import JobCreateResponse, JobStatusResponse
+
+router = APIRouter()
+
+
+@router.post("/upload", response_model=JobCreateResponse)
+async def upload_and_start_job(
+    background_tasks: BackgroundTasks,
+    audio_file: UploadFile = File(...),
+    character_image: UploadFile = File(None),
+    style: str = Form("hip-hop"),
+    aspect_ratio: str = Form("9:16"),
+    target_duration: int = Form(210)  # 3.5 minutes default
+):
+    """
+    Upload audio file and optionally a character image.
+    Starts the video generation pipeline.
+    """
+    
+    # Validate audio file
+    if not audio_file.filename.endswith(('.mp3', '.wav', '.m4a', '.flac')):
+        raise HTTPException(400, "Invalid audio format. Use MP3, WAV, M4A, or FLAC.")
+    
+    # Generate job ID
+    job_id = str(uuid.uuid4())
+    
+    # Create job directory
+    job_dir = Path(settings.UPLOAD_DIR) / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Save audio file
+    audio_path = job_dir / f"audio{Path(audio_file.filename).suffix}"
+    async with aiofiles.open(audio_path, 'wb') as f:
+        content = await audio_file.read()
+        await f.write(content)
+    
+    # Save character image if provided
+    character_image_path = None
+    if character_image:
+        character_image_path = job_dir / f"character{Path(character_image.filename).suffix}"
+        async with aiofiles.open(character_image_path, 'wb') as f:
+            content = await character_image.read()
+            await f.write(content)
+    
+    # Create job in database
+    job = Job(
+        id=job_id,
+        status=JobStatus.PENDING,
+        audio_path=str(audio_path),
+        character_image_path=str(character_image_path) if character_image_path else None,
+        style=style,
+        aspect_ratio=aspect_ratio,
+        target_duration=target_duration
+    )
+    await job.save()
+    
+    # Queue the pipeline
+    background_tasks.add_task(start_video_generation_pipeline, job_id)
+    
+    return JobCreateResponse(
+        job_id=job_id,
+        status="pending",
+        message="Job created. Processing will begin shortly.",
+        status_url=f"/api/jobs/{job_id}"
+    )
+
+
+@router.get("/jobs/{job_id}", response_model=JobStatusResponse)
+async def get_job_status(job_id: str):
+    """Get the current status of a video generation job."""
+    
+    job = await Job.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    
+    response = JobStatusResponse(
+        job_id=job.id,
+        status=job.status.value,
+        progress=job.progress,
+        current_step=job.current_step,
+        created_at=job.created_at,
+        updated_at=job.updated_at
+    )
+    
+    if job.status == JobStatus.COMPLETED:
+        response.output_url = f"/api/jobs/{job_id}/download"
+    
+    if job.status == JobStatus.FAILED:
+        response.error = job.error_message
+    
+    return response
+
+
+@router.get("/jobs/{job_id}/download")
+async def download_video(job_id: str):
+    """Download the completed video."""
+    from fastapi.responses import FileResponse
+    
+    job = await Job.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    
+    if job.status != JobStatus.COMPLETED:
+        raise HTTPException(400, f"Job not ready. Current status: {job.status.value}")
+    
+    if not job.output_path or not Path(job.output_path).exists():
+        raise HTTPException(404, "Output file not found")
+    
+    return FileResponse(
+        job.output_path,
+        media_type="video/mp4",
+        filename=f"dance_video_{job_id}.mp4"
+    )
+Step 6.2: Pipeline Orchestration
+backend/workers/pipeline.py:
+pythonimport asyncio
+import logging
+from pathlib import Path
+from typing import Optional
+
+from backend.models.job import Job, JobStatus
+from backend.services.audio_analyzer import AudioAnalyzer
+from backend.services.choreographer import Choreographer
+from backend.services.video_generator import VideoGenerator, ClipGenerationRequest
+from backend.services.video_assembler import VideoAssembler, ClipInfo, AssemblyConfig
+from backend.config import settings
+
+logger = logging.getLogger(__name__)
+
+
+class VideoPipeline:
+    """Orchestrates the full video generation pipeline."""
+    
+    def __init__(self, job_id: str):
+        self.job_id = job_id
+        self.job: Optional[Job] = None
+        
+        # Initialize services
+        self.audio_analyzer = AudioAnalyzer()
+        self.choreographer = Choreographer()
+        self.video_generator = VideoGenerator()
+        self.video_assembler = VideoAssembler()
+    
+    async def run(self):
+        """Execute the full pipeline."""
+        try:
+            # Load job
+            self.job = await Job.get(self.job_id)
+            if not self.job:
+                raise ValueError(f"Job {self.job_id} not found")
+            
+            await self._update_status(JobStatus.ANALYZING_AUDIO, 0, "Analyzing audio...")
+            
+            # Step 1: Audio Analysis
+            audio_analysis = self.audio_analyzer.analyze(self.job.audio_path)
+            self.job.audio_analysis = audio_analysis.to_dict()
+            await self.job.save()
+            
+            await self._update_status(JobStatus.PLANNING, 15, "Creating choreography...")
+            
+            # Step 2: Generate Storyboard
+            storyboard = await self.choreographer.create_storyboard(
+                audio_analysis=audio_analysis.to_dict(),
+                style=self.job.style,
+                character_description="professional dancer in stylish attire"
+            )
+            self.job.storyboard = storyboard.model_dump()
+            await self.job.save()
+            
+            await self._update_status(JobStatus.GENERATING_CLIPS, 25, "Generating dance clips...")
+            
+            # Step 3: Generate Video Clips
+            clips = await self._generate_clips(storyboard, audio_analysis.to_dict())
+            
+            if not clips:
+                raise RuntimeError("No clips were generated successfully")
+            
+            await self._update_status(JobStatus.ASSEMBLING, 80, "Assembling final video...")
+            
+            # Step 4: Assemble Final Video
+            output_path = Path(settings.OUTPUT_DIR) / f"{self.job_id}_final.mp4"
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            config = AssemblyConfig(
+                output_path=str(output_path),
+                audio_path=self.job.audio_path,
+                resolution=self._parse_aspect_ratio(self.job.aspect_ratio)
+            )
+            
+            final_path = await self.video_assembler.assemble_full_video(clips, config)
+            
+            if not final_path:
+                raise RuntimeError("Video assembly failed")
+            
+            # Complete!
+            self.job.output_path = final_path
+            await self._update_status(JobStatus.COMPLETED, 100, "Complete!")
+            
+            logger.info(f"Pipeline completed for job {self.job_id}")
+            
+        except Exception as e:
+            logger.exception(f"Pipeline failed for job {self.job_id}")
+            if self.job:
+                self.job.status = JobStatus.FAILED
+                self.job.error_message = str(e)
+                await self.job.save()
+    
+    async def _generate_clips(self, storyboard, audio_analysis: dict) -> list[ClipInfo]:
+        """Generate all video clips from storyboard."""
+        
+        # Prepare generation requests
+        requests = []
+        for i, segment in enumerate(storyboard.segments):
+            requests.append(ClipGenerationRequest(
+                segment_id=i,
+                character_image_url=self.job.character_image_path or settings.DEFAULT_CHARACTER_IMAGE,
+                motion_prompt=segment.motion_prompt,
+                duration=segment.end - segment.start,
+                template_id=segment.template_id
+            ))
+        
+        # Generate in batches
+        total_segments = len(requests)
+        results = []
+        batch_size = 5
+        
+        for batch_start in range(0, total_segments, batch_size):
+            batch = requests[batch_start:batch_start + batch_size]
+            batch_results = await self.video_generator.generate_batch(batch, max_concurrent=3)
+            results.extend(batch_results)
+            
+            # Update progress
+            progress = 25 + int((batch_start + len(batch)) / total_segments * 55)
+            await self._update_status(
+                JobStatus.GENERATING_CLIPS,
+                progress,
+                f"Generated {batch_start + len(batch)}/{total_segments} clips..."
+            )
+        
+        # Convert to ClipInfo objects
+        clips = []
+        for result, segment in zip(results, storyboard.segments):
+            if result.success:
+                clips.append(ClipInfo(
+                    segment_id=result.segment_id,
+                    start=segment.start,
+                    end=segment.end,
+                    source_path=result.video_url or result.video_path,
+                    duration=segment.end - segment.start
+                ))
+        
+        return clips
+    
+    async def _update_status(self, status: JobStatus, progress: int, step: str):
+        """Update job status and progress."""
+        self.job.status = status
+        self.job.progress = progress
+        self.job.current_step = step
+        await self.job.save()
+    
+    def _parse_aspect_ratio(self, ratio: str) -> tuple:
+        """Convert aspect ratio string to resolution."""
+        ratios = {
+            "9:16": (1080, 1920),  # Vertical (TikTok, Reels)
+            "16:9": (1920, 1080),  # Horizontal (YouTube)
+            "1:1": (1080, 1080),   # Square (Instagram)
+        }
+        return ratios.get(ratio, (1080, 1920))
+
+
+async def start_video_generation_pipeline(job_id: str):
+    """Entry point for background task."""
+    pipeline = VideoPipeline(job_id)
+    await pipeline.run()
+
+Phase 7: Frontend Interface (Day 9-10)
+frontend/index.html:
+html<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Music Dance Video Generator</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🎵 Music to Dance Video</h1>
+            <p>Upload your music and watch AI create a dance video!</p>
+        </header>
+
+        <main>
+            <!-- Upload Form -->
+            <form id="uploadForm" class="upload-form">
+                <div class="form-group">
+                    <label for="audioFile">Music File (MP3, WAV)</label>
+                    <input type="file" id="audioFile" accept=".mp3,.wav,.m4a,.flac" required>
+                    <div class="file-preview" id="audioPreview"></div>
+                </div>
+
+                <div class="form-group">
+                    <label for="characterImage">Character Image (Optional)</label>
+                    <input type="file" id="characterImage" accept="image/*">
+                    <div class="file-preview" id="imagePreview"></div>
+                </div>
+
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="style">Dance Style</label>
+                        <select id="style">
+                            <option value="hip-hop">Hip-Hop</option>
+                            <option value="afrobeat">Afrobeat</option>
+                            <option value="k-pop">K-Pop</option>
+                            <option value="contemporary">Contemporary</option>
+                            <option value="latin">Latin</option>
+                        </select>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="aspectRatio">Aspect Ratio</label>
+                        <select id="aspectRatio">
+                            <option value="9:16">9:16 (TikTok/Reels)</option>
+                            <option value="16:9">16:9 (YouTube)</option>
+                            <option value="1:1">1:1 (Square)</option>
+                        </select>
+                    </div>
+                </div>
+
+                <button type="submit" class="submit-btn">Generate Dance Video 🎬</button>
+            </form>
+
+            <!-- Progress Section -->
+            <div id="progressSection" class="progress-section hidden">
+                <h2>Processing Your Video</h2>
+                <div class="progress-bar">
+                    <div class="progress-fill" id="progressFill"></div>
+                </div>
+                <p class="status-text" id="statusText">Starting...</p>
+                <div class="step-indicator" id="stepIndicator"></div>
+            </div>
+
+            <!-- Result Section -->
+            <div id="resultSection" class="result-section hidden">
+                <h2>🎉 Your Video is Ready!</h2>
+                <video id="resultVideo" controls></video>
+                <a id="downloadLink" class="download-btn">Download Video</a>
+            </div>
+
+            <!-- Error Section -->
+            <div id="errorSection" class="error-section hidden">
+                <h2>❌ Something went wrong</h2>
+                <p id="errorMessage"></p>
+                <button onclick="location.reload()">Try Again</button>
+            </div>
+        </main>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
+frontend/app.js:
+javascriptconst API_BASE = 'http://localhost:8000/api';
+
+const uploadForm = document.getElementById('uploadForm');
+const progressSection = document.getElementById('progressSection');
+const resultSection = document.getElementById('resultSection');
+const errorSection = document.getElementById('errorSection');
+
+let currentJobId = null;
+let pollInterval = null;
+
+// File preview
+document.getElementById('audioFile').addEventListener('change', (e) => {
+    const file = e.target.files[0];
+    if (file) {
+        document.getElementById('audioPreview').textContent = `📁 ${file.name} (${(file.size/1024/1024).toFixed(2)} MB)`;
+    }
+});
+
+document.getElementById('characterImage').addEventListener('change', (e) => {
+    const file = e.target.files[0];
+    if (file) {
+        const reader = new FileReader();
+        reader.onload = (e) => {
+            document.getElementById('imagePreview').innerHTML = `<img src="${e.target.result}" alt="Character preview">`;
+        };
+        reader.readAsDataURL(file);
+    }
+});
+
+// Form submission
+uploadForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    
+    const formData = new FormData();
+    formData.append('audio_file', document.getElementById('audioFile').files[0]);
+    
+    const characterImage = document.getElementById('characterImage').files[0];
+    if (characterImage) {
+        formData.append('character_image', characterImage);
+    }
+    
+    formData.append('style', document.getElementById('style').value);
+    formData.append('aspect_ratio', document.getElementById('aspectRatio').value);
+    
+    try {
+        // Hide form, show progress
+        uploadForm.classList.add('hidden');
+        progressSection.classList.remove('hidden');
+        
+        // Submit job
+        const response = await fetch(`${API_BASE}/upload`, {
+            method: 'POST',
+            body: formData
+        });
+        
+        if (!response.ok) {
+            throw new Error('Upload failed');
+        }
+        
+        const data = await response.json();
+        currentJobId = data.job_id;
+        
+        // Start polling for status
+        pollJobStatus();
+        
+    } catch (error) {
+        showError(error.message);
+    }
+});
+
+async function pollJobStatus() {
+    pollInterval = setInterval(async () => {
+        try {
+            const response = await fetch(`${API_BASE}/jobs/${currentJobId}`);
+            const data = await response.json();
+            
+            updateProgress(data);
+            
+            if (data.status === 'completed') {
+                clearInterval(pollInterval);
+                showResult(data);
+            } else if (data.status === 'failed') {
+                clearInterval(pollInterval);
+                showError(data.error || 'Video generation failed');
+            }
+            
+        } catch (error) {
+            console.error('Poll error:', error);
+        }
+    }, 2000); // Poll every 2 seconds
+}
+
+function updateProgress(data) {
+    const progressFill = document.getElementById('progressFill');
+    const statusText = document.getElementById('statusText');
+    const stepIndicator = document.getElementById('stepIndicator');
+    
+    progressFill.style.width = `${data.progress}%`;
+    statusText.textContent = data.current_step || 'Processing...';
+    
+    // Update step indicators
+    const steps = [
+        { key: 'analyzing_audio', label: 'Analyzing Audio', threshold: 15 },
+        { key: 'planning', label: 'Creating Choreography', threshold: 25 },
+        { key: 'generating_clips', label: 'Generating Clips', threshold: 80 },
+        { key: 'assembling', label: 'Assembling Video', threshold: 100 }
+    ];
+    
+    stepIndicator.innerHTML = steps.map((step, i) => `
+        <div class="step ${data.progress >= step.threshold ? 'completed' : ''}">
+            <span class="step-number">${i + 1}</span>
+            <span class="step-label">${step.label}</span>
+        </div>
+    `).join('');
+}
+
+function showResult(data) {
+    progressSection.classList.add('hidden');
+    resultSection.classList.remove('hidden');
+    
+    const video = document.getElementById('resultVideo');
+    video.src = `${API_BASE}/jobs/${currentJobId}/download`;
+    
+    const downloadLink = document.getElementById('downloadLink');
+    downloadLink.href = `${API_BASE}/jobs/${currentJobId}/download`;
+    downloadLink.download = `dance_video_${currentJobId}.mp4`;
+}
+
+function showError(message) {
+    progressSection.classList.add('hidden');
+    uploadForm.classList.add('hidden');
+    errorSection.classList.remove('hidden');
+    document.getElementById('errorMessage').textContent = message;
+}
+
+4. Development Workflow with Claude Code
+Daily Workflow Commands
+bash# Start Claude Code session
+claude
+
+# Common prompts to use with Claude Code:
+
+# 1. Scaffold new component
+> Create the database model for Job in backend/models/job.py with SQLAlchemy
+
+# 2. Debug issues
+> The audio analysis is failing with this error: [paste error]. Fix it.
+
+# 3. Add tests
+> Write unit tests for the Choreographer service
+
+# 4. Optimize code
+> The video assembly is slow. Optimize it for faster processing.
+
+# 5. Add features
+> Add support for multiple output resolutions in the video assembler
+Setup Script
+scripts/setup.sh:
+bash#!/bin/bash
+set -e
+
+echo "🎵 Setting up Music Dance Video Generator..."
+
+# Create virtual environment
+python -m venv venv
+source venv/bin/activate
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Create directories
+mkdir -p storage/{uploads,clips,output}
+
+# Copy environment file
+cp .env.example .env
+echo "⚠️  Please edit .env with your API keys"
+
+# Install FFmpeg (macOS)
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    brew install ffmpeg
+fi
+
+# Start Redis (using Docker)
+docker-compose up -d redis
+
+echo "✅ Setup complete!"
+echo "Run: uvicorn backend.main:app --reload"
+docker-compose.yml:
+yamlversion: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+volumes:
+  redis_data:
+
+5. Testing Strategy
+scripts/test_pipeline.py:
+python"""Manual pipeline test script."""
+import asyncio
+from pathlib import Path
+
+# Add project root to path
+import sys
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from backend.services.audio_analyzer import AudioAnalyzer
+from backend.services.choreographer import Choreographer
+
+
+async def test_audio_analysis():
+    """Test audio analysis with sample file."""
+    analyzer = AudioAnalyzer()
+    
+    # Use a test MP3 file
+    test_file = "storage/test_samples/sample.mp3"
+    if not Path(test_file).exists():
+        print("⚠️  Create a test file at storage/test_samples/sample.mp3")
+        return
+    
+    result = analyzer.analyze(test_file)
+    print("Audio Analysis Result:")
+    print(f"  Duration: {result.duration_sec}s")
+    print(f"  BPM: {result.bpm}")
+    print(f"  Sections: {len(result.sections)}")
+    for section in result.sections:
+        print(f"    - {section.label}: {section.start}s - {section.end}s (energy: {section.energy})")
+    
+    return result
+
+
+async def test_choreographer(audio_analysis):
+    """Test choreography generation."""
+    choreographer = Choreographer()
+    
+    storyboard = await choreographer.create_storyboard(
+        audio_analysis=audio_analysis.to_dict(),
+        style="hip-hop"
+    )
+    
+    print("\nStoryboard Result:")
+    print(f"  Style: {storyboard.style}")
+    print(f"  Segments: {len(storyboard.segments)}")
+    for seg in storyboard.segments[:5]:  # First 5 segments
+        print(f"    - {seg.start}s-{seg.end}s: {seg.motion_prompt[:50]}...")
+
+
+async def main():
+    print("🧪 Running Pipeline Tests\n")
+    
+    # Test 1: Audio Analysis
+    print("=" * 50)
+    print("TEST 1: Audio Analysis")
+    print("=" * 50)
+    analysis = await test_audio_analysis()
+    
+    if analysis:
+        # Test 2: Choreographer
+        print("\n" + "=" * 50)
+        print("TEST 2: Choreography Generation")
+        print("=" * 50)
+        await test_choreographer(analysis)
+    
+    print("\n✅ Tests complete!")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
