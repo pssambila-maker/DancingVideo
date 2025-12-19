@@ -1,0 +1,86 @@
+{
+  "metadata": {
+    "filename": "test_audio.mp3",
+    "duration_seconds": 259.4,
+    "duration_formatted": "04:19",
+    "file_size_mb": 5.83
+  },
+  "audio_features": {
+    "bpm": 117.5,
+    "genre": "Pop/Dance",
+    "mood": "Upbeat",
+    "total_beats": 499,
+    "avg_energy": 0.434,
+    "energy_variance": 0.036
+  },
+  "sections": [
+    {
+      "id": 0,
+      "label": "Intro",
+      "start": 0.0,
+      "end": 0.46,
+      "duration": 0.46,
+      "energy": 0.5,
+      "timestamp": "00:00"
+    },
+    {
+      "id": 1,
+      "label": "Intro",
+      "start": 0.46,
+      "end": 8.89,
+      "duration": 8.43,
+      "energy": 0.095,
+      "timestamp": "00:00"
+    },
+    {
+      "id": 2,
+      "label": "Intro",
+      "start": 8.89,
+      "end": 53.68,
+      "duration": 44.79,
+      "energy": 0.287,
+      "timestamp": "00:08"
+    },
+    {
+      "id": 3,
+      "label": "Verse",
+      "start": 53.68,
+      "end": 85.61,
+      "duration": 31.93,
+      "energy": 0.398,
+      "timestamp": "00:53"
+    },
+    {
+      "id": 4,
+      "label": "Pre-Chorus",
+      "start": 85.61,
+      "end": 110.74,
+      "duration": 25.12,
+      "energy": 0.522,
+      "timestamp": "01:25"
+    },
+    {
+      "id": 5,
+      "label": "Verse",
+      "start": 110.74,
+      "end": 117.86,
+      "duration": 7.13,
+      "energy": 0.377,
+      "timestamp": "01:50"
+    },
+    {
+      "id": 6,
+      "label": "Outro",
+      "start": 117.86,
+      "end": 240.77,
+      "duration": 122.9,
+      "energy": 0.539,
+      "timestamp": "01:57"
+    }
+  ],
+  "youtube_metadata": {
+    "genre": "Pop/Dance",
+    "mood": "Upbeat",
+    "key_moments": []
+  }
+}
